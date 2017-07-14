@@ -255,8 +255,8 @@ class CaseData(spark: SparkSession, p: Params) extends Serializable {
     }
     val caseNum: Int = in.caseNum
     val status: Int = if (in.status.equalsIgnoreCase("Closed")) 0 else 1
-    val dateOpen: Option[Timestamp] = getTimestamp(in.dateOpen)
-    val dateClose: Option[Timestamp] = getTimestamp(in.dateClose)
+    val dateOpen: Option[Timestamp] = getTimestamp(in.dateOpen, caseNum, false)
+    val dateClose: Option[Timestamp] = getTimestamp(in.dateClose, caseNum, true)
     val accountID: Int = getAccountID(in.accountID).getOrElse(-1)
     val ambariVersion: Int =  {
       var version:String = if (in.ambariVersion == null) NOT_USE_AMBARI else in.ambariVersion
@@ -273,24 +273,55 @@ class CaseData(spark: SparkSession, p: Params) extends Serializable {
     val env: Option[Int] = if (in.Env == null) None else getEnv(in.Env)
     val resolutionTime: Option[Int] = getResolutionTimeToMinute(in.ResolutionTime)
 
-
+    if (in.rootcause.equalsIgnoreCase("Undetermined at this time") && status == 0){
+      doc.add((caseNum, s"Case is closed with invalid Root Cause ${in.rootcause}."))
+    } else if ((in.rootcause.equalsIgnoreCase("Working as Designed") || in.rootcause.equalsIgnoreCase("Use Case Advice")) && status == 0 && severity == 1){
+      doc.add((caseNum, s"S1(Production Down) should NOT be caused by root cause: ${in.rootcause}."))
+    } else if (in.rootcause.equalsIgnoreCase("Documentation Defect") && status == 0 && hBug.isEmpty){
+      doc.add((caseNum, s"Case caused by ${in.rootcause} without any Doc BUG filed."))
+    } else if(in.rootcause.equalsIgnoreCase("System Limitation") && status == 0 && rmp.isEmpty){
+      doc.add((caseNum, s"Case caused by ${in.rootcause} without any RMP filed."))
+    } else if (in.rootcause.equalsIgnoreCase("No Customer Response") && status == 0 && severity == 1) {
+      doc.add((caseNum, s"Is this a real S1 (Production Down) with No Customer Response?"))
+    } else if (in.rootcause.equalsIgnoreCase("Product Defect") && status == 0 && (hBug.isEmpty && aBug.isEmpty)){
+      doc.add((caseNum, s"Case is closed with Root Cause ${in.rootcause}, but there is no proper BUG documented."))
+    }
 
     OutputDS(severity, caseNum,status,dateOpen,dateClose,accountID,ambariVersion,stackVersion,component,hBug,aBug,hotfix,EAR,rootcause,rmp, env, resolutionTime)
   }
 
-  def getTimestamp(s: String) : Option[Timestamp] = s match {
+  def getTimestamp(s: String, caseNum: Int, ignoreNull : Boolean = true) : Option[Timestamp] = s match {
     case "" =>
-      logger.debug("Null date.")
-      None
-    case _ => { // 20170306 064703.000
-      val format = new SimpleDateFormat("yyyyMMdd' 'HHmmss")
-      Try(new Timestamp(format.parse(s).getTime)) match {
+      if (!ignoreNull){
+        logger.error(s"Open Date is not available for case ${caseNum}, data is wrong.")
+        None
+      }
+      else {
+        logger.debug(s"Close date for case ${caseNum} is not available yet.")
+        None
+      }
+    case _ => {
+      // 20170306 064703.000
+      val format1 = new SimpleDateFormat("yyyyMMdd' 'HHmmss")
+
+      //6/9/17 13:09
+      val format2 = new SimpleDateFormat("MM/dd/yy' 'HH:mm")
+      Try(new Timestamp(format1.parse(s).getTime)) match {
         case Success(t) =>
-          logger.debug("Successfull get timestamp for "+ s + " => " + t)
+          logger.debug(s"Successfull get timestamp for case ${caseNum} "+ s + " => " + t)
           Some(t)
         case Failure(e) =>
-          logger.error(s"Fail to get timestamp for ${s} with exception ${e}, date format need to follow: ${format}.")
-          None
+          logger.warn(s"Fail to get timestamp in case ${caseNum} for ${s} with exception ${e}, date format need to follow: ${format1.toPattern}.")
+          logger.info(s"Trying to parse the timestamp using different time format: ${format2.toPattern}...")
+          Try(new Timestamp(format2.parse(s).getTime)) match  {
+            case Success(t) =>
+              logger.debug(s"Successfull get timestamp for case ${caseNum} "+ s + " => " + t)
+              Some(t)
+            case Failure(e) =>
+              logger.warn(s"Fail to get timestamp in case ${caseNum} for ${s} with exception ${e}, date format need to follow: ${format2.toPattern}.")
+              logger.error(s"Exhausted to get the timestamp using all acceptable format.")
+              None
+          }
       }
     }
   }
@@ -299,7 +330,7 @@ class CaseData(spark: SparkSession, p: Params) extends Serializable {
     val i = s.lastIndexOf("-")
 
     if (i < 0){
-      doc.add((caseNum, s"Invalid JIRA URL without '-' : ${s}"))
+      doc.add((caseNum, s"Invalid JIRA URL: ${s}"))
       return None
     }else if (backTrackLength < 0){
       val slash = s.substring(0,i).lastIndexOf("/")
@@ -492,6 +523,10 @@ class CaseData(spark: SparkSession, p: Params) extends Serializable {
     //workaround for Spark-20771
     val openDate = out.dateOpen
 
+    if (openDate.isEmpty){
+      logger.warn(s"Open date of Case ${out.caseNum} is empty, use the current date as workaround.")
+    }
+
     val cal = Calendar.getInstance()
 
     cal.setTime(openDate.getOrElse(cal.getTime))
@@ -502,6 +537,8 @@ class CaseData(spark: SparkSession, p: Params) extends Serializable {
 
     val finalFormat = new SimpleDateFormat("MM-dd")
     val week = finalFormat.format(cal.getTime)
+
+    logger.info(s"Case ${out.caseNum} belongs to partition year=${year} / week = ${week}")
 
     FinalDS(out.severity, out.caseNum, out.status, out.dateOpen, out.dateClose, out.accountID, out.ambariVersionID, out.stackVersionID, out.componentID,
       out.hBug, out.aBug, out.hotfix, out.EAR, out.rootcauseID, out.RMP, out.Env, out.ResolutionTime, year, week)
@@ -542,10 +579,12 @@ class CaseData(spark: SparkSession, p: Params) extends Serializable {
     if (docMap.isEmpty)
       println("No Documentation issue Found! Perfect!")
     else{
-      println("====================================== Documentation issue(s) found =====================================")
+      val number = docMap.size
+      val startLine = s"===============================  Documentation issue(s) found in ${number} case(s) =============================="
+      println(startLine)
 
       docMap.foreach{ en =>
-        val st = s"Case ${en._1}        "
+        val st = s"Case ${en._1}    "
         val commentSet = en._2
 
         println(st + "  |  " + commentSet.head)
@@ -557,9 +596,34 @@ class CaseData(spark: SparkSession, p: Params) extends Serializable {
           rest.foreach(c => println(space + "  |  " + c))
         }
 
-        println("---------------------------------------------------------------------------------------------------------")
+        val lineLen = startLine.length
+
+        val bottomLine = "-" * lineLen
+
+        println(bottomLine)
       }
     }
+
+    val src = p.file
+
+    val cal = Calendar.getInstance()
+
+    val finalFormat = new SimpleDateFormat("yyyyMMdd")
+
+    val date = finalFormat.format(cal.getTime)
+
+    val dst = src.substring(0,src.lastIndexOf(".")) + "_" + date + "_SUCCESS.csv"
+
+    val hadoopConf = spark.sparkContext.hadoopConfiguration
+    val fs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
+
+    Try(fs.rename(new org.apache.hadoop.fs.Path(src), new org.apache.hadoop.fs.Path(dst))) match {
+      case Success(t) =>
+        logger.debug(s"Successfull rename file from ${src} to ${dst}")
+      case Failure(e) =>
+        logger.error(s"Failed to rename file from ${src} to ${dst}: " + e)
+    }
+
 
   }
 }
